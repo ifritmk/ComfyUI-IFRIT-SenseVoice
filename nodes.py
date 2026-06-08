@@ -1,3 +1,4 @@
+import difflib
 import os
 import re
 import uuid
@@ -260,6 +261,29 @@ def _split_text_for_srt(text, max_chars=28):
     return parts
 
 
+def _chars_no_space(text):
+    return [char for char in _clean_asr_text(text) if not char.isspace()]
+
+
+def _split_text_by_weights(text, weights):
+    chars = _chars_no_space(text)
+    if not chars or not weights:
+        return []
+
+    total_weight = max(1, sum(max(1, int(weight)) for weight in weights))
+    cursor = 0
+    parts = []
+    for index, weight in enumerate(weights):
+        if index == len(weights) - 1:
+            end = len(chars)
+        else:
+            end = round(len(chars) * sum(max(1, int(value)) for value in weights[: index + 1]) / total_weight)
+            end = max(cursor + 1, min(end, len(chars) - (len(weights) - index - 1)))
+        parts.append("".join(chars[cursor:end]).strip())
+        cursor = end
+    return parts
+
+
 def _append_weighted_srt_entries(entries, text, time_ranges):
     parts = _split_text_for_srt(text)
     if not parts or not time_ranges:
@@ -304,6 +328,54 @@ def _append_weighted_srt_entries(entries, text, time_ranges):
     return True
 
 
+def _split_text_by_reference(reference_text, target_text, max_chars=28):
+    target_chars = _chars_no_space(target_text)
+    if not target_chars:
+        return []
+
+    reference_parts = _split_text_for_srt(reference_text, max_chars=max_chars)
+    if not reference_parts:
+        return _split_text_for_srt(target_text, max_chars=max_chars)
+
+    reference_chars = _chars_no_space(reference_text)
+    if not reference_chars:
+        weights = [len(_chars_no_space(part)) for part in reference_parts]
+        return _split_text_by_weights(target_text, weights)
+
+    matcher = difflib.SequenceMatcher(None, reference_chars, target_chars, autojunk=False)
+    mapped_positions = {}
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in {"equal", "replace"}:
+            length = min(i2 - i1, j2 - j1)
+            for offset in range(length):
+                mapped_positions[i1 + offset] = j1 + offset
+
+    parts = []
+    ref_cursor = 0
+    target_cursor = 0
+    for index, reference_part in enumerate(reference_parts):
+        ref_len = len(_chars_no_space(reference_part))
+        ref_end = ref_cursor + ref_len
+        if index == len(reference_parts) - 1:
+            target_end = len(target_chars)
+        else:
+            candidates = [
+                mapped_positions[pos]
+                for pos in range(ref_cursor, ref_end)
+                if pos in mapped_positions
+            ]
+            if candidates:
+                target_end = max(candidates) + 1
+            else:
+                target_end = round(len(target_chars) * ref_end / max(1, len(reference_chars)))
+            target_end = max(target_cursor + 1, min(target_end, len(target_chars) - (len(reference_parts) - index - 1)))
+        parts.append("".join(target_chars[target_cursor:target_end]).strip())
+        target_cursor = target_end
+        ref_cursor = ref_end
+
+    return [part for part in parts if part]
+
+
 def _append_timestamp_text_entries(entries, text, timestamps):
     text = _clean_asr_text(text)
     if not text:
@@ -345,6 +417,114 @@ def _append_timestamp_text_entries(entries, text, timestamps):
     if group_tokens:
         _append_srt_entry(entries, "".join(group_tokens), group_start, group_end)
     return True
+
+
+def _extract_timed_text_segments_from_item(item):
+    if not isinstance(item, dict):
+        return []
+
+    segments = []
+    sentence_info = item.get("sentence_info")
+    if isinstance(sentence_info, list):
+        for sentence in sentence_info:
+            if not isinstance(sentence, dict):
+                continue
+            text = _clean_asr_text(sentence.get("text", sentence.get("sentence", "")))
+            start = _first_present(sentence, "start", "start_time")
+            end = _first_present(sentence, "end", "end_time")
+            try:
+                start_value = float(start)
+                end_value = float(end)
+            except (TypeError, ValueError):
+                continue
+            if max(start_value, end_value) > 100:
+                start_value = _seconds_from_milliseconds(start_value)
+                end_value = _seconds_from_milliseconds(end_value)
+            else:
+                start_value = _seconds_from_any(start_value)
+                end_value = _seconds_from_any(end_value)
+            if text and start_value is not None and end_value is not None and end_value > start_value:
+                segments.append((start_value, end_value, text))
+
+    timestamps = item.get("timestamp")
+    words = item.get("words")
+    item_text = _clean_asr_text(item.get("text", ""))
+    if isinstance(timestamps, list):
+        timestamp_ranges = []
+        timestamp_texts = []
+        for index, chunk in enumerate(timestamps):
+            if not isinstance(chunk, (list, tuple)) or len(chunk) < 2:
+                continue
+            start = _seconds_from_milliseconds(chunk[0])
+            end = _seconds_from_milliseconds(chunk[1])
+            if start is None or end is None or end <= start:
+                continue
+            if len(chunk) > 2:
+                text = _clean_asr_text(chunk[2])
+            elif isinstance(words, list) and index < len(words):
+                text = _clean_asr_text(words[index])
+            else:
+                text = ""
+            timestamp_ranges.append((start, end))
+            timestamp_texts.append(text)
+        if any(timestamp_texts):
+            group_start = None
+            group_end = None
+            group_text = ""
+            for (start, end), token in zip(timestamp_ranges, timestamp_texts):
+                if group_start is None:
+                    group_start = start
+                group_end = end
+                group_text += token
+                if _is_sentence_break(token[-1:]) or (group_end - group_start) >= 3.0 or len(group_text) >= 28:
+                    segments.append((group_start, group_end, group_text))
+                    group_start = None
+                    group_end = None
+                    group_text = ""
+            if group_text:
+                segments.append((group_start, group_end, group_text))
+        elif item_text and timestamp_ranges:
+            temp_entries = []
+            if _append_timestamp_text_entries(temp_entries, item_text, timestamps):
+                segments.extend(temp_entries)
+            else:
+                weights = [max(1, len(part)) for part in _split_text_for_srt(item_text)]
+                parts = _split_text_by_weights(item_text, weights)
+                for part, (start, end) in zip(parts, timestamp_ranges):
+                    segments.append((start, end, part))
+
+    segments.sort(key=lambda value: (value[0], value[1]))
+    return segments
+
+
+def _append_aligned_srt_entries(entries, timestamp_result, text):
+    items = timestamp_result if isinstance(timestamp_result, list) else [timestamp_result]
+    timed_segments = []
+    for item in items:
+        timed_segments.extend(_extract_timed_text_segments_from_item(item))
+    timed_segments = [
+        (start, end, segment_text)
+        for start, end, segment_text in timed_segments
+        if segment_text and end > start
+    ]
+    if len(timed_segments) < 2:
+        return False
+
+    reference_text = "".join(segment_text for _, _, segment_text in timed_segments)
+    aligned_parts = _split_text_by_reference(reference_text, text)
+    if not aligned_parts:
+        weights = [len(_chars_no_space(segment_text)) for _, _, segment_text in timed_segments]
+        aligned_parts = _split_text_by_weights(text, weights)
+    if not aligned_parts:
+        return False
+
+    if len(aligned_parts) != len(timed_segments):
+        weights = [len(_chars_no_space(segment_text)) for _, _, segment_text in timed_segments]
+        aligned_parts = _split_text_by_weights(text, weights)
+
+    for (start, end, _), part in zip(timed_segments, aligned_parts):
+        _append_srt_entry(entries, part, start, end)
+    return bool(entries)
 
 
 def _extract_time_ranges_from_item(item):
@@ -518,6 +698,17 @@ def _build_srt_with_text(timestamp_result, text):
 
     items = timestamp_result if isinstance(timestamp_result, list) else [timestamp_result]
     entries = []
+    if _append_aligned_srt_entries(entries, timestamp_result, text):
+        entries.sort(key=lambda entry: (entry[0], entry[1]))
+        blocks = []
+        for index, (start, end, entry_text) in enumerate(entries, start=1):
+            blocks.append(
+                f"{index}\n"
+                f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n"
+                f"{entry_text}"
+            )
+        return "\n\n".join(blocks)
+
     time_ranges = []
     for item in items:
         time_ranges.extend(_extract_time_ranges_from_item(item))
