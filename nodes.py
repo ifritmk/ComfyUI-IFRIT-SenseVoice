@@ -574,7 +574,11 @@ class SenseVoiceTranscribeFile:
             "merge_vad": True,
             "merge_length_s": 15,
         }
-        if config["sentence_timestamp"] and getattr(recognizer, "punc_model", None) is not None:
+        if (
+            model == "Fun-ASR-Nano-2512"
+            and config["sentence_timestamp"]
+            and getattr(recognizer, "punc_model", None) is not None
+        ):
             generate_kwargs["sentence_timestamp"] = True
 
         result = recognizer.generate(**generate_kwargs)
