@@ -216,6 +216,24 @@ def _seconds_from_milliseconds(value):
         return None
 
 
+def _timestamp_values_are_milliseconds(values):
+    clean_values = []
+    for value in values:
+        try:
+            clean_values.append(abs(float(value)))
+        except (TypeError, ValueError):
+            pass
+    if not clean_values:
+        return False
+    return max(clean_values) > 1000
+
+
+def _timestamp_pair_seconds(start, end, milliseconds=False):
+    if milliseconds:
+        return _seconds_from_milliseconds(start), _seconds_from_milliseconds(end)
+    return _seconds_from_any(start), _seconds_from_any(end)
+
+
 def _append_srt_entry(entries, text, start, end, milliseconds=False):
     text = str(text or "").strip()
     if milliseconds:
@@ -468,10 +486,14 @@ def _append_timestamp_text_entries(entries, text, timestamps):
         return False
 
     clean_timestamps = []
+    timestamp_values = []
     for chunk in timestamps:
         if isinstance(chunk, (list, tuple)) and len(chunk) >= 2:
-            start = _seconds_from_milliseconds(chunk[0])
-            end = _seconds_from_milliseconds(chunk[1])
+            timestamp_values.extend([chunk[0], chunk[1]])
+    timestamps_are_ms = _timestamp_values_are_milliseconds(timestamp_values)
+    for chunk in timestamps:
+        if isinstance(chunk, (list, tuple)) and len(chunk) >= 2:
+            start, end = _timestamp_pair_seconds(chunk[0], chunk[1], timestamps_are_ms)
             if start is not None and end is not None:
                 clean_timestamps.append((start, end))
     if not clean_timestamps:
@@ -536,17 +558,27 @@ def _extract_timed_text_segments_from_item(item):
             if text and start_value is not None and end_value is not None and end_value > start_value:
                 segments.append((start_value, end_value, text))
 
+    if segments:
+        segments.sort(key=lambda value: (value[0], value[1]))
+        return segments
+
     timestamps = item.get("timestamp")
     words = item.get("words")
     item_text = _clean_asr_text(item.get("text", ""))
     if isinstance(timestamps, list):
+        timestamp_values = [
+            value
+            for timestamp in timestamps
+            if isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2
+            for value in (timestamp[0], timestamp[1])
+        ]
+        timestamps_are_ms = _timestamp_values_are_milliseconds(timestamp_values)
         timestamp_ranges = []
         timestamp_texts = []
         for index, chunk in enumerate(timestamps):
             if not isinstance(chunk, (list, tuple)) or len(chunk) < 2:
                 continue
-            start = _seconds_from_milliseconds(chunk[0])
-            end = _seconds_from_milliseconds(chunk[1])
+            start, end = _timestamp_pair_seconds(chunk[0], chunk[1], timestamps_are_ms)
             if start is None or end is None or end <= start:
                 continue
             if len(chunk) > 2:
@@ -644,6 +676,7 @@ def _extract_time_ranges_from_item(item):
     ranges = []
     sentence_info = item.get("sentence_info")
     if isinstance(sentence_info, list):
+        sentence_entries_before = len(entries)
         for sentence in sentence_info:
             if not isinstance(sentence, dict):
                 continue
@@ -667,13 +700,23 @@ def _extract_time_ranges_from_item(item):
         timestamps = item.get(key)
         if not isinstance(timestamps, list):
             continue
+        timestamp_values = []
         for timestamp in timestamps:
             if isinstance(timestamp, dict):
-                start = _seconds_from_any(_first_present(timestamp, "start", "start_time"))
-                end = _seconds_from_any(_first_present(timestamp, "end", "end_time"))
+                timestamp_values.extend([
+                    _first_present(timestamp, "start", "start_time"),
+                    _first_present(timestamp, "end", "end_time"),
+                ])
             elif isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2:
-                start = _seconds_from_milliseconds(timestamp[0])
-                end = _seconds_from_milliseconds(timestamp[1])
+                timestamp_values.extend([timestamp[0], timestamp[1]])
+        timestamps_are_ms = _timestamp_values_are_milliseconds(timestamp_values)
+        for timestamp in timestamps:
+            if isinstance(timestamp, dict):
+                start_raw = _first_present(timestamp, "start", "start_time")
+                end_raw = _first_present(timestamp, "end", "end_time")
+                start, end = _timestamp_pair_seconds(start_raw, end_raw, timestamps_are_ms)
+            elif isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2:
+                start, end = _timestamp_pair_seconds(timestamp[0], timestamp[1], timestamps_are_ms)
             else:
                 continue
             if start is not None and end is not None and end > start:
@@ -689,6 +732,7 @@ def _collect_srt_entries_from_item(item, entries):
 
     sentence_info = item.get("sentence_info")
     if isinstance(sentence_info, list):
+        sentence_entries_before = len(entries)
         for sentence in sentence_info:
             if not isinstance(sentence, dict):
                 continue
@@ -702,10 +746,19 @@ def _collect_srt_entries_from_item(item, entries):
                 _first_present(sentence, "start", "start_time"),
                 _first_present(sentence, "end", "end_time"),
             )
+        if len(entries) > sentence_entries_before:
+            return
 
     timestamps = item.get("timestamp")
     words = item.get("words")
     if isinstance(timestamps, list):
+        timestamp_values = [
+            value
+            for timestamp in timestamps
+            if isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2
+            for value in (timestamp[0], timestamp[1])
+        ]
+        timestamps_are_ms = _timestamp_values_are_milliseconds(timestamp_values)
         timestamp_entries_before = len(entries)
         for index, chunk in enumerate(timestamps):
             if not isinstance(chunk, (list, tuple)) or len(chunk) < 2:
@@ -716,7 +769,7 @@ def _collect_srt_entries_from_item(item, entries):
                 text = words[index]
             else:
                 continue
-            _append_srt_entry(entries, text, chunk[0], chunk[1], milliseconds=True)
+            _append_srt_entry(entries, text, chunk[0], chunk[1], milliseconds=timestamps_are_ms)
         if len(entries) == timestamp_entries_before:
             _append_timestamp_text_entries(entries, item.get("text", ""), timestamps)
 
