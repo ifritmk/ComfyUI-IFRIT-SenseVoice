@@ -618,30 +618,15 @@ def _extract_timed_text_segments_from_item(item):
             timestamp_ranges.append((start, end))
             timestamp_texts.append(text)
         if any(timestamp_texts):
-            group_start = None
-            group_end = None
-            group_text = ""
             for (start, end), token in zip(timestamp_ranges, timestamp_texts):
-                if group_start is None:
-                    group_start = start
-                group_end = end
-                group_text += token
-                if _is_sentence_break(token[-1:]) or (group_end - group_start) >= 3.0 or len(group_text) >= 28:
-                    segments.append((group_start, group_end, group_text))
-                    group_start = None
-                    group_end = None
-                    group_text = ""
-            if group_text:
-                segments.append((group_start, group_end, group_text))
+                if token:
+                    segments.append((start, end, token))
         elif item_text and timestamp_ranges:
-            temp_entries = []
-            if _append_timestamp_text_entries(temp_entries, item_text, timestamps):
-                segments.extend(temp_entries)
-            else:
-                weights = [max(1, len(part)) for part in _split_text_for_srt(item_text)]
-                parts = _split_text_by_weights(item_text, weights)
-                for part, (start, end) in zip(parts, timestamp_ranges):
-                    segments.append((start, end, part))
+            item_chars = _alignment_chars_with_positions(item_text)[0]
+            usable = min(len(item_chars), len(timestamp_ranges))
+            for index in range(usable):
+                start, end = timestamp_ranges[index]
+                segments.append((start, end, item_chars[index]))
 
     segments.sort(key=lambda value: (value[0], value[1]))
     return segments
@@ -683,24 +668,40 @@ def _append_aligned_srt_entries(entries, timestamp_result, text):
     if not mapping:
         return False
 
-    for sense_part, (sense_start, sense_end) in zip(sense_parts, _alignment_index_ranges(raw_sense_parts)):
+    last_token_end = -1
+    previous_para_end_char = -1
+    sense_ranges = _alignment_index_ranges(raw_sense_parts)
+    total_sense_chars = max(1, len(sense_chars))
+    total_para_chars = max(1, len(para_chars))
+    for sense_part, (sense_start, sense_end) in zip(sense_parts, sense_ranges):
         if sense_end < sense_start:
             continue
         para_start_char = _nearest_mapped_index(mapping, sense_start, len(sense_chars), 1)
         para_end_char = _nearest_mapped_index(mapping, sense_end, len(sense_chars), -1)
-        if para_start_char is None or para_end_char is None:
-            continue
+        if para_start_char is None:
+            para_start_char = round(sense_start * (total_para_chars - 1) / max(1, total_sense_chars - 1))
+        if para_end_char is None:
+            para_end_char = round(sense_end * (total_para_chars - 1) / max(1, total_sense_chars - 1))
         if para_end_char < para_start_char:
             para_start_char, para_end_char = para_end_char, para_start_char
+        para_start_char = max(para_start_char, previous_para_end_char + 1)
+        para_end_char = max(para_end_char, para_start_char)
         para_start_char = max(0, min(para_start_char, len(para_token_indexes) - 1))
         para_end_char = max(0, min(para_end_char, len(para_token_indexes) - 1))
         token_start = para_token_indexes[para_start_char]
         token_end = para_token_indexes[para_end_char]
         if token_end < token_start:
             token_start, token_end = token_end, token_start
+        token_start = max(token_start, last_token_end + 1)
+        token_end = max(token_end, token_start)
+        if token_start >= len(timed_segments):
+            break
+        token_end = min(token_end, len(timed_segments) - 1)
         start = timed_segments[token_start][0]
         end = timed_segments[token_end][1]
         _append_srt_entry(entries, sense_part, start, end)
+        last_token_end = token_end
+        previous_para_end_char = para_end_char
     return bool(entries)
 
 
