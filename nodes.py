@@ -118,27 +118,20 @@ def _optional_pipeline_model(config, choice, local_dir_name, ids, label):
     return _ensure_model(model_id, model_dir, config["hub"], label)
 
 
-def _get_model(model_choice, vad_model, punc_model, spk_model, device):
+def _get_model(model_choice, device):
     config = _model_config(model_choice)
     local_model = _resolve_local_model(model_choice)
 
     local_vad_model = None
-    local_punc_model = None
-    local_spk_model = None
-    if vad_model and vad_model != "none":
+    if model_choice == "Paraformer-Large":
         vad_model_id = VAD_MODEL_IDS[config["hub"]]
         vad_model_dir = os.path.join(config["dir"], "fsmn-vad")
         local_vad_model = _ensure_model(vad_model_id, vad_model_dir, config["hub"], "fsmn-vad")
-    if model_choice in ("Paraformer-Large", "SenseVoiceSmall"):
-        local_punc_model = _optional_pipeline_model(config, punc_model, "ct-punc", PUNC_MODEL_IDS, "ct-punc")
-        local_spk_model = _optional_pipeline_model(config, spk_model, "cam++", SPK_MODEL_IDS, "cam++")
 
     cache_key = (
         model_choice,
         local_model,
         local_vad_model or "none",
-        local_punc_model or "none",
-        local_spk_model or "none",
         device,
     )
     if cache_key in MODEL_CACHE:
@@ -167,11 +160,6 @@ def _get_model(model_choice, vad_model, punc_model, spk_model, device):
     if local_vad_model:
         kwargs["vad_model"] = local_vad_model
         kwargs["vad_kwargs"] = {"max_single_segment_time": 30000}
-    if local_punc_model:
-        kwargs["punc_model"] = local_punc_model
-    if local_spk_model:
-        kwargs["spk_model"] = local_spk_model
-        kwargs["spk_mode"] = "punc_segment" if local_punc_model else "vad_segment"
 
     model = AutoModel(**kwargs)
     MODEL_CACHE[cache_key] = model
@@ -281,7 +269,7 @@ def _first_present(item, *keys):
 
 
 def _is_sentence_break(token):
-    return token in {".", "!", "?", "\u3002", "\uff01", "\uff1f"}
+    return token in {".", "!", "\u3002", "\uff01", "\uff1f"}
 
 
 def _clean_asr_text(text):
@@ -328,28 +316,31 @@ def _append_timestamp_text_entries(entries, text, timestamps):
     if not clean_timestamps:
         return False
 
-    chars = [char for char in text if not char.isspace()]
-    if not chars:
+    tokens = text.split()
+    if not tokens:
+        tokens = [char for char in text if not char.isspace()]
+    if not tokens:
         return False
 
     group_start = None
     group_end = None
-    group_chars = []
-    usable = min(len(chars), len(clean_timestamps))
+    group_tokens = []
+    usable = min(len(tokens), len(clean_timestamps))
     for index in range(usable):
-        char = chars[index]
+        token = tokens[index]
         start, end = clean_timestamps[index]
         if group_start is None:
             group_start = start
         group_end = end
-        group_chars.append(char)
-        if _is_sentence_break(char) or (group_end - group_start) >= 6.0 or len(group_chars) >= 42:
-            _append_srt_entry(entries, "".join(group_chars), group_start, group_end)
+        group_tokens.append(token)
+        text_part = "".join(group_tokens)
+        if _is_sentence_break(token[-1]) or (group_end - group_start) >= 6.0 or len(text_part) >= 42:
+            _append_srt_entry(entries, text_part, group_start, group_end)
             group_start = None
             group_end = None
-            group_chars = []
-    if group_chars:
-        _append_srt_entry(entries, "".join(group_chars), group_start, group_end)
+            group_tokens = []
+    if group_tokens:
+        _append_srt_entry(entries, "".join(group_tokens), group_start, group_end)
     return True
 
 
@@ -478,15 +469,9 @@ class SenseVoiceTranscribeAudio:
             "required": {
                 "audio": ("AUDIO",),
                 "model": (MODEL_CHOICES, {"default": "Paraformer-Large"}),
-                "language": (["auto", "zh", "en", "yue", "ja", "ko", "nospeech"],),
                 "device": (["auto", "cuda:0", "cpu"],),
-                "use_itn": ("BOOLEAN", {"default": True}),
                 "batch_size_s": ("INT", {"default": 60, "min": 1, "max": 600, "step": 1}),
-            },
-            "optional": {
-                "vad_model": (["none", "fsmn-vad"],),
-                "punc_model": (["none", "ct-punc"],),
-                "spk_model": (["none", "cam++"],),
+                "unload_model": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -499,13 +484,9 @@ class SenseVoiceTranscribeAudio:
         self,
         audio,
         model,
-        language,
         device,
-        use_itn,
         batch_size_s,
-        vad_model="none",
-        punc_model="none",
-        spk_model="none",
+        unload_model,
     ):
         duration = _audio_duration(audio)
         audio_path = _save_audio_to_temp(audio)
@@ -513,13 +494,9 @@ class SenseVoiceTranscribeAudio:
             return SenseVoiceTranscribeFile().transcribe(
                 audio_path,
                 model,
-                language,
                 device,
-                use_itn,
                 batch_size_s,
-                vad_model,
-                punc_model,
-                spk_model,
+                unload_model,
                 duration,
             )
         finally:
@@ -536,15 +513,9 @@ class SenseVoiceTranscribeFile:
             "required": {
                 "audio_path": ("STRING", {"default": ""}),
                 "model": (MODEL_CHOICES, {"default": "Paraformer-Large"}),
-                "language": (["auto", "zh", "en", "yue", "ja", "ko", "nospeech"],),
                 "device": (["auto", "cuda:0", "cpu"],),
-                "use_itn": ("BOOLEAN", {"default": True}),
                 "batch_size_s": ("INT", {"default": 60, "min": 1, "max": 600, "step": 1}),
-            },
-            "optional": {
-                "vad_model": (["none", "fsmn-vad"],),
-                "punc_model": (["none", "ct-punc"],),
-                "spk_model": (["none", "cam++"],),
+                "unload_model": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -557,13 +528,9 @@ class SenseVoiceTranscribeFile:
         self,
         audio_path,
         model,
-        language,
         device,
-        use_itn,
         batch_size_s,
-        vad_model="none",
-        punc_model="none",
-        spk_model="none",
+        unload_model,
         audio_duration=None,
     ):
         if not audio_path:
@@ -577,30 +544,32 @@ class SenseVoiceTranscribeFile:
 
         infer_device = _get_device(device)
         config = _model_config(model)
-        recognizer = _get_model(model, vad_model, punc_model, spk_model, infer_device)
-        language_arg = "auto" if language == "auto" else language
+        recognizer = _get_model(model, infer_device)
 
         generate_kwargs = {
             "input": audio_path,
             "cache": {},
-            "language": language_arg,
-            config["itn_arg"]: bool(use_itn),
             "batch_size_s": int(batch_size_s),
             "merge_vad": True,
             "merge_length_s": 15,
         }
-        if model == "Paraformer-Large" or (model == "SenseVoiceSmall" and spk_model != "none"):
+        if model == "Paraformer-Large":
             generate_kwargs["output_timestamp"] = True
             generate_kwargs["return_time_stamps"] = True
-        if (
-            model == "Paraformer-Large"
-            and config["sentence_timestamp"]
-            and getattr(recognizer, "punc_model", None) is not None
-            and getattr(recognizer, "spk_model", None) is None
-        ):
-            generate_kwargs["sentence_timestamp"] = True
 
         result = recognizer.generate(**generate_kwargs)
+        if unload_model:
+            for cache_key in list(MODEL_CACHE):
+                if cache_key[0] == model and cache_key[-1] == infer_device:
+                    MODEL_CACHE.pop(cache_key, None)
+            try:
+                import gc
+                import torch
+
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         return _normalize_result(result, audio_duration)
 
 

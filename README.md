@@ -22,7 +22,7 @@ SenseVoiceSmall
 
 `Paraformer-Large` 适合中文识别和时间戳/SRT 输出。
 
-`SenseVoiceSmall` 适合语音识别、情感标签和事件标签。如果需要说话人标签，可以启用 `spk_model=cam++`。
+`SenseVoiceSmall` 适合语音识别、情感标签和事件标签。
 
 ## 本地模型目录
 
@@ -35,20 +35,11 @@ F:\code\comfyui\models\SenseVoiceSmall
 
 如果目录不存在，节点会把选中的模型下载到对应固定目录。
 
-启用 `vad_model=fsmn-vad` 时，VAD 模型会放在：
+`Paraformer-Large` 会自动搭配 `fsmn-vad` 进行长音频分段，VAD 模型会放在：
 
 ```text
 F:\code\comfyui\models\Paraformer-Large\fsmn-vad
 F:\code\comfyui\models\SenseVoiceSmall\fsmn-vad
-```
-
-启用 `punc_model=ct-punc` 或 `spk_model=cam++` 时，辅助模型会放在当前主模型目录下：
-
-```text
-F:\code\comfyui\models\Paraformer-Large\ct-punc
-F:\code\comfyui\models\Paraformer-Large\cam++
-F:\code\comfyui\models\SenseVoiceSmall\ct-punc
-F:\code\comfyui\models\SenseVoiceSmall\cam++
 ```
 
 离线部署时，请提前把上述模型目录放好。
@@ -68,13 +59,9 @@ F:\code\comfyui\.ext\python.exe -m pip install funasr huggingface_hub modelscope
 ## 输入参数
 
 - `model`：选择 `Paraformer-Large` 或 `SenseVoiceSmall`
-- `language`：语言，支持 `auto`、`zh`、`en`、`yue`、`ja`、`ko`、`nospeech`
 - `device`：推理设备，支持 `auto`、`cuda:0`、`cpu`
-- `use_itn`：是否启用逆文本归一化
 - `batch_size_s`：推理批处理时长，单位秒
-- `vad_model`：选择 `fsmn-vad` 或 `none`
-- `punc_model`：选择 `ct-punc` 或 `none`
-- `spk_model`：选择 `cam++` 或 `none`
+- `unload_model`：任务结束后是否释放已缓存模型
 
 ## 输出
 
@@ -92,28 +79,19 @@ ctc_timestamps
 
 如果模型没有返回真实时间戳，`srt` 会为空，不会用音频总时长硬切假字幕。
 
+当前 SRT 生成逻辑参考 `ComfyUI-AV-FunASR`：优先使用 FunASR 返回的 `timestamp`，再把识别文本按真实时间戳聚合成字幕段；不会平均分配音频时长。
+
 ## 使用建议
 
 中文字幕优先使用：
 
 ```text
 model=Paraformer-Large
-vad_model=fsmn-vad
-punc_model=ct-punc
-spk_model=none
-```
-
-需要说话人标签时再开启：
-
-```text
-spk_model=cam++
+batch_size_s=300
 ```
 
 如果只想要 SenseVoice 的情感/事件标签，可以使用：
 
 ```text
 model=SenseVoiceSmall
-vad_model=fsmn-vad
-punc_model=none
-spk_model=none
 ```
