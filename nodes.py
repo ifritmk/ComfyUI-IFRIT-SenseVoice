@@ -1,6 +1,8 @@
 import difflib
+import json
 import os
 import re
+import tempfile
 import unicodedata
 import uuid
 
@@ -373,6 +375,18 @@ def _nearest_mapped_index(mapping, source_index, source_len, direction):
     return None
 
 
+def _write_srt_debug_log(payload):
+    try:
+        debug_dir = os.path.join(tempfile.gettempdir(), "comfyui_funasr")
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_path = os.path.join(debug_dir, f"funasr_srt_debug_{uuid.uuid4().hex}.json")
+        with open(debug_path, "w", encoding="utf-8") as debug_file:
+            json.dump(payload, debug_file, ensure_ascii=False, indent=2)
+        print(f"[FunASR] SRT debug log: {debug_path}")
+    except Exception as error:
+        print(f"[FunASR] Failed to write SRT debug log: {error}")
+
+
 def _clean_srt_text(text):
     chars = []
     previous_space = False
@@ -668,16 +682,19 @@ def _append_aligned_srt_entries(entries, timestamp_result, text):
     if not mapping:
         return False
 
+    debug_rows = []
     last_token_end = -1
     previous_para_end_char = -1
     sense_ranges = _alignment_index_ranges(raw_sense_parts)
     total_sense_chars = max(1, len(sense_chars))
     total_para_chars = max(1, len(para_chars))
-    for sense_part, (sense_start, sense_end) in zip(sense_parts, sense_ranges):
+    for row_index, (sense_part, (sense_start, sense_end)) in enumerate(zip(sense_parts, sense_ranges), start=1):
         if sense_end < sense_start:
             continue
         para_start_char = _nearest_mapped_index(mapping, sense_start, len(sense_chars), 1)
         para_end_char = _nearest_mapped_index(mapping, sense_end, len(sense_chars), -1)
+        mapped_para_start_char = para_start_char
+        mapped_para_end_char = para_end_char
         if para_start_char is None:
             para_start_char = round(sense_start * (total_para_chars - 1) / max(1, total_sense_chars - 1))
         if para_end_char is None:
@@ -700,8 +717,37 @@ def _append_aligned_srt_entries(entries, timestamp_result, text):
         start = timed_segments[token_start][0]
         end = timed_segments[token_end][1]
         _append_srt_entry(entries, sense_part, start, end)
+        debug_rows.append(
+            {
+                "row": row_index,
+                "sense_text": sense_part,
+                "sense_range": [sense_start, sense_end],
+                "mapped_para_range": [mapped_para_start_char, mapped_para_end_char],
+                "used_para_range": [para_start_char, para_end_char],
+                "token_range": [token_start, token_end],
+                "token_text": "".join(segment_text for _, _, segment_text in timed_segments[token_start : token_end + 1]),
+                "start": start,
+                "end": end,
+                "duration": end - start,
+            }
+        )
         last_token_end = token_end
         previous_para_end_char = para_end_char
+    _write_srt_debug_log(
+        {
+            "mode": "aligned",
+            "sense_part_count": len(sense_parts),
+            "sense_char_count": len(sense_chars),
+            "para_char_count": len(para_chars),
+            "timed_segment_count": len(timed_segments),
+            "mapping_count": len(mapping),
+            "timed_segments_head": [
+                {"index": index, "start": start, "end": end, "text": segment_text}
+                for index, (start, end, segment_text) in enumerate(timed_segments[:80])
+            ],
+            "rows": debug_rows,
+        }
+    )
     return bool(entries)
 
 
@@ -900,14 +946,24 @@ def _build_srt_with_text(timestamp_result, text):
     items = timestamp_result if isinstance(timestamp_result, list) else [timestamp_result]
     entries = []
     if _append_aligned_srt_entries(entries, timestamp_result, text):
-        entries.sort(key=lambda entry: (entry[0], entry[1]))
         blocks = []
+        final_rows = []
         for index, (start, end, entry_text) in enumerate(entries, start=1):
             blocks.append(
                 f"{index}\n"
                 f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n"
                 f"{entry_text}"
             )
+            final_rows.append(
+                {
+                    "row": index,
+                    "start": start,
+                    "end": end,
+                    "duration": end - start,
+                    "text": entry_text,
+                }
+            )
+        _write_srt_debug_log({"mode": "final-aligned", "rows": final_rows})
         return "\n\n".join(blocks)
 
     time_ranges = []
@@ -916,12 +972,23 @@ def _build_srt_with_text(timestamp_result, text):
     if _append_weighted_srt_entries(entries, text, time_ranges):
         entries.sort(key=lambda entry: (entry[0], entry[1]))
         blocks = []
+        final_rows = []
         for index, (start, end, entry_text) in enumerate(entries, start=1):
             blocks.append(
                 f"{index}\n"
                 f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n"
                 f"{entry_text}"
             )
+            final_rows.append(
+                {
+                    "row": index,
+                    "start": start,
+                    "end": end,
+                    "duration": end - start,
+                    "text": entry_text,
+                }
+            )
+        _write_srt_debug_log({"mode": "final-weighted", "rows": final_rows})
         return "\n\n".join(blocks)
 
     patched_items = []
