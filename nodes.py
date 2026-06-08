@@ -189,8 +189,13 @@ def _get_model(model_choice, vad_model, punc_model, spk_model, device):
     local_model = _resolve_local_model(model_choice)
     remote_code = None
     if model_choice == "Fun-ASR-Nano-2512":
-        remote_code = _ensure_nano_runtime(config, local_model)
-        _import_nano_runtime(remote_code)
+        try:
+            from funasr.register import tables
+        except Exception as e:
+            raise RuntimeError(_import_error_message(e))
+        if tables.model_classes.get("FunASRNano") is None:
+            remote_code = _ensure_nano_runtime(config, local_model)
+            _import_nano_runtime(remote_code)
 
     local_vad_model = None
     local_punc_model = None
@@ -207,8 +212,6 @@ def _get_model(model_choice, vad_model, punc_model, spk_model, device):
     if model_choice == "SenseVoiceSmall":
         local_punc_model = _optional_pipeline_model(config, punc_model, "ct-punc", PUNC_MODEL_IDS, "ct-punc")
         local_spk_model = _optional_pipeline_model(config, spk_model, "cam++", SPK_MODEL_IDS, "cam++")
-        if local_spk_model and not local_punc_model:
-            raise RuntimeError("spk_model=cam++ requires punc_model=ct-punc.")
 
     cache_key = (
         model_choice,
@@ -250,7 +253,7 @@ def _get_model(model_choice, vad_model, punc_model, spk_model, device):
         kwargs["punc_model"] = local_punc_model
     if local_spk_model:
         kwargs["spk_model"] = local_spk_model
-        kwargs["spk_mode"] = "punc_segment"
+        kwargs["spk_mode"] = "punc_segment" if local_punc_model else "vad_segment"
 
     model = AutoModel(**kwargs)
     MODEL_CACHE[cache_key] = model
@@ -343,6 +346,15 @@ def _append_srt_entry(entries, text, start, end, milliseconds=False):
     entries.append((start, end, text))
 
 
+def _append_srt_entry_auto_time(entries, text, start, end):
+    try:
+        start_value = float(start)
+        end_value = float(end)
+    except (TypeError, ValueError):
+        return
+    _append_srt_entry(entries, text, start, end, milliseconds=max(start_value, end_value) > 100)
+
+
 def _first_present(item, *keys):
     for key in keys:
         if key in item and item[key] is not None:
@@ -352,6 +364,35 @@ def _first_present(item, *keys):
 
 def _is_sentence_break(token):
     return token in {".", "!", "?", "\u3002", "\uff01", "\uff1f"}
+
+
+def _clean_asr_text(text):
+    text = str(text or "")
+    text = re.sub(r"<\|[^|]+?\|>", "", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _split_plain_text(text, max_chars=42):
+    text = _clean_asr_text(text)
+    if not text:
+        return []
+
+    parts = []
+    current = ""
+    for char in text:
+        current += char
+        if _is_sentence_break(char) or len(current) >= max_chars:
+            part = current.strip()
+            if part:
+                parts.append(part)
+            current = ""
+    current = current.strip()
+    if current:
+        parts.append(current)
+    return parts
 
 
 def _collect_srt_entries_from_item(item, entries):
@@ -367,12 +408,11 @@ def _collect_srt_entries_from_item(item, entries):
             speaker = _first_present(sentence, "speaker", "spk", "spk_id")
             if speaker is not None:
                 text = f"Speaker {speaker}: {text}"
-            _append_srt_entry(
+            _append_srt_entry_auto_time(
                 entries,
                 text,
                 _first_present(sentence, "start", "start_time"),
                 _first_present(sentence, "end", "end_time"),
-                milliseconds=True,
             )
 
     timestamps = item.get("timestamp")
@@ -445,11 +485,20 @@ def _build_srt(result, fallback_text="", fallback_duration=None):
     fallback_text = str(fallback_text or "").strip()
     fallback_duration = _seconds_from_any(fallback_duration)
     if fallback_text and fallback_duration and fallback_duration > 0:
-        return (
-            "1\n"
-            f"00:00:00,000 --> {_srt_timestamp(fallback_duration)}\n"
-            f"{fallback_text}"
-        )
+        parts = _split_plain_text(fallback_text)
+        if not parts:
+            return ""
+        block_seconds = fallback_duration / len(parts)
+        blocks = []
+        for index, part in enumerate(parts, start=1):
+            start = (index - 1) * block_seconds
+            end = fallback_duration if index == len(parts) else index * block_seconds
+            blocks.append(
+                f"{index}\n"
+                f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n"
+                f"{part}"
+            )
+        return "\n\n".join(blocks)
     return ""
 
 
@@ -469,9 +518,9 @@ def _normalize_result(result, fallback_duration=None):
                     for sentence in item["sentence_info"]
                 )
             if text is not None:
-                texts.append(str(text).strip())
+                texts.append(_clean_asr_text(text))
         elif item is not None:
-            texts.append(str(item).strip())
+            texts.append(_clean_asr_text(item))
 
     text = "\n".join(part for part in texts if part)
     srt = _build_srt(result, text, fallback_duration)
@@ -596,13 +645,14 @@ class SenseVoiceTranscribeFile:
             "merge_vad": True,
             "merge_length_s": 15,
         }
-        if model == "Fun-ASR-Nano-2512":
-            generate_kwargs["batch_size"] = 1
-            generate_kwargs["batch_size_s"] = 1
+        if model == "SenseVoiceSmall" and spk_model != "none":
+            generate_kwargs["output_timestamp"] = True
+            generate_kwargs["return_time_stamps"] = True
         if (
             model == "Fun-ASR-Nano-2512"
             and config["sentence_timestamp"]
             and getattr(recognizer, "punc_model", None) is not None
+            and getattr(recognizer, "spk_model", None) is None
         ):
             generate_kwargs["sentence_timestamp"] = True
 
