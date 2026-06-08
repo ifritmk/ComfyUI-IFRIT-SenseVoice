@@ -1,24 +1,20 @@
 import json
 import os
 import re
-import sys
-import urllib.request
 import uuid
 
 import folder_paths
 
 
 MODEL_CACHE = {}
-NANO_RUNTIME_IMPORTED = False
-MODEL_CHOICES = ["Fun-ASR-Nano-2512", "SenseVoiceSmall"]
+MODEL_CHOICES = ["Paraformer-Large", "SenseVoiceSmall"]
 MODEL_CONFIGS = {
-    "Fun-ASR-Nano-2512": {
-        "id": "FunAudioLLM/Fun-ASR-Nano-2512",
-        "dir": os.path.join(folder_paths.models_dir, "Fun-ASR-Nano-2512"),
-        "runtime_url": "https://raw.githubusercontent.com/FunAudioLLM/Fun-ASR/main",
-        "hub": "hf",
-        "trust_remote_code": True,
-        "itn_arg": "itn",
+    "Paraformer-Large": {
+        "id": "iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "dir": os.path.join(folder_paths.models_dir, "Paraformer-Large"),
+        "hub": "ms",
+        "trust_remote_code": False,
+        "itn_arg": "use_itn",
         "sentence_timestamp": True,
     },
     "SenseVoiceSmall": {
@@ -42,7 +38,6 @@ SPK_MODEL_IDS = {
     "hf": "funasr/campplus",
     "ms": "iic/speech_campplus_sv_zh-cn_16k-common",
 }
-NANO_RUNTIME_FILES = ("model.py", "ctc.py", "tools/utils.py")
 
 
 def _import_error_message(error):
@@ -115,67 +110,6 @@ def _ensure_model(model_id, local_dir, hub, label):
     return local_dir
 
 
-def _download_text_file(url, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    print(f"[FunASR] Downloading runtime file: {url}")
-    with urllib.request.urlopen(url, timeout=60) as response:
-        data = response.read()
-    with open(path, "wb") as file:
-        file.write(data)
-
-
-def _ensure_nano_runtime(config, local_model):
-    runtime_dir = os.path.join(local_model, "runtime")
-    runtime_url = config["runtime_url"].rstrip("/")
-    missing = []
-    for name in NANO_RUNTIME_FILES:
-        target = os.path.join(runtime_dir, *name.split("/"))
-        if not os.path.exists(target):
-            missing.append((name, target))
-
-    for name, target in missing:
-        _download_text_file(f"{runtime_url}/{name}", target)
-
-    tools_dir = os.path.join(runtime_dir, "tools")
-    os.makedirs(tools_dir, exist_ok=True)
-    init_file = os.path.join(tools_dir, "__init__.py")
-    if not os.path.exists(init_file):
-        with open(init_file, "w", encoding="utf-8") as file:
-            file.write("")
-
-    model_code = os.path.join(runtime_dir, "model.py")
-    if not os.path.exists(model_code):
-        raise RuntimeError(
-            "Fun-ASR-Nano-2512 runtime code is missing. Expected:\n"
-            f"{model_code}"
-        )
-    return model_code.replace("\\", "/")
-
-
-def _import_nano_runtime(model_code):
-    global NANO_RUNTIME_IMPORTED
-    if NANO_RUNTIME_IMPORTED:
-        return
-
-    runtime_dir = os.path.dirname(model_code)
-    if runtime_dir not in sys.path:
-        sys.path.insert(0, runtime_dir)
-
-    try:
-        from funasr.utils.dynamic_import import import_module_from_path
-        from funasr.register import tables
-    except Exception as e:
-        raise RuntimeError(_import_error_message(e))
-
-    import_module_from_path(model_code)
-    if tables.model_classes.get("FunASRNano") is None:
-        raise RuntimeError(
-            "Fun-ASR-Nano-2512 runtime loaded, but FunASRNano was not registered.\n"
-            f"runtime: {model_code}"
-        )
-    NANO_RUNTIME_IMPORTED = True
-
-
 def _optional_pipeline_model(config, choice, local_dir_name, ids, label):
     if not choice or choice == "none":
         return None
@@ -187,15 +121,6 @@ def _optional_pipeline_model(config, choice, local_dir_name, ids, label):
 def _get_model(model_choice, vad_model, punc_model, spk_model, device):
     config = _model_config(model_choice)
     local_model = _resolve_local_model(model_choice)
-    remote_code = None
-    if model_choice == "Fun-ASR-Nano-2512":
-        try:
-            from funasr.register import tables
-        except Exception as e:
-            raise RuntimeError(_import_error_message(e))
-        if tables.model_classes.get("FunASRNano") is None:
-            remote_code = _ensure_nano_runtime(config, local_model)
-            _import_nano_runtime(remote_code)
 
     local_vad_model = None
     local_punc_model = None
@@ -203,13 +128,8 @@ def _get_model(model_choice, vad_model, punc_model, spk_model, device):
     if vad_model and vad_model != "none":
         vad_model_id = VAD_MODEL_IDS[config["hub"]]
         vad_model_dir = os.path.join(config["dir"], "fsmn-vad")
-        if model_choice == "Fun-ASR-Nano-2512" and not (
-            os.path.isdir(vad_model_dir) and os.listdir(vad_model_dir)
-        ):
-            print(f"[FunASR] Skip fsmn-vad for {model_choice}; local VAD model not found: {vad_model_dir}")
-        else:
-            local_vad_model = _ensure_model(vad_model_id, vad_model_dir, config["hub"], "fsmn-vad")
-    if model_choice == "SenseVoiceSmall":
+        local_vad_model = _ensure_model(vad_model_id, vad_model_dir, config["hub"], "fsmn-vad")
+    if model_choice in ("Paraformer-Large", "SenseVoiceSmall"):
         local_punc_model = _optional_pipeline_model(config, punc_model, "ct-punc", PUNC_MODEL_IDS, "ct-punc")
         local_spk_model = _optional_pipeline_model(config, spk_model, "cam++", SPK_MODEL_IDS, "cam++")
 
@@ -244,8 +164,6 @@ def _get_model(model_choice, vad_model, punc_model, spk_model, device):
     }
     if config["trust_remote_code"]:
         kwargs["trust_remote_code"] = True
-    if remote_code:
-        kwargs["remote_code"] = remote_code
     if local_vad_model:
         kwargs["vad_model"] = local_vad_model
         kwargs["vad_kwargs"] = {"max_single_segment_time": 30000}
@@ -516,7 +434,7 @@ class SenseVoiceTranscribeAudio:
         return {
             "required": {
                 "audio": ("AUDIO",),
-                "model": (MODEL_CHOICES, {"default": "Fun-ASR-Nano-2512"}),
+                "model": (MODEL_CHOICES, {"default": "Paraformer-Large"}),
                 "language": (["auto", "zh", "en", "yue", "ja", "ko", "nospeech"],),
                 "device": (["auto", "cuda:0", "cpu"],),
                 "use_itn": ("BOOLEAN", {"default": True}),
@@ -574,7 +492,7 @@ class SenseVoiceTranscribeFile:
         return {
             "required": {
                 "audio_path": ("STRING", {"default": ""}),
-                "model": (MODEL_CHOICES, {"default": "Fun-ASR-Nano-2512"}),
+                "model": (MODEL_CHOICES, {"default": "Paraformer-Large"}),
                 "language": (["auto", "zh", "en", "yue", "ja", "ko", "nospeech"],),
                 "device": (["auto", "cuda:0", "cpu"],),
                 "use_itn": ("BOOLEAN", {"default": True}),
@@ -632,7 +550,7 @@ class SenseVoiceTranscribeFile:
             generate_kwargs["output_timestamp"] = True
             generate_kwargs["return_time_stamps"] = True
         if (
-            model == "Fun-ASR-Nano-2512"
+            model == "Paraformer-Large"
             and config["sentence_timestamp"]
             and getattr(recognizer, "punc_model", None) is not None
             and getattr(recognizer, "spk_model", None) is None

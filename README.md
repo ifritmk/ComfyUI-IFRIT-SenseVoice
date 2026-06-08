@@ -16,30 +16,22 @@ ComfyUI custom nodes for testing FunASR speech recognition models with SRT outpu
 The node exposes a `model` dropdown:
 
 ```text
-Fun-ASR-Nano-2512
+Paraformer-Large
 SenseVoiceSmall
 ```
 
-Use `Fun-ASR-Nano-2512` for recognition with timestamps.
+Use `Paraformer-Large` for Chinese recognition with timestamps.
 
 Use `SenseVoiceSmall` for recognition with emotion and event tags.
 
 SenseVoiceSmall can also produce timestamped sentence output through the FunASR pipeline when `vad_model=fsmn-vad` and `punc_model=ct-punc` are enabled. Enable `spk_model=cam++` as well to add speaker labels.
-
-`Fun-ASR-Nano-2512` is not registered by FunASR 1.1.x by default. The node automatically downloads the small runtime files from `FunAudioLLM/Fun-ASR` into:
-
-```text
-F:\code\comfyui\models\Fun-ASR-Nano-2512\runtime
-```
-
-The model weights stay in `F:\code\comfyui\models\Fun-ASR-Nano-2512`.
 
 ## Local Model Paths
 
 Models are stored under ComfyUI's `models` folder:
 
 ```text
-F:\code\comfyui\models\Fun-ASR-Nano-2512
+F:\code\comfyui\models\Paraformer-Large
 F:\code\comfyui\models\SenseVoiceSmall
 ```
 
@@ -48,7 +40,7 @@ If a folder does not exist, the plugin downloads the selected model to its fixed
 When `vad_model` is `fsmn-vad`, the VAD model is kept under the selected model folder:
 
 ```text
-F:\code\comfyui\models\Fun-ASR-Nano-2512\fsmn-vad
+F:\code\comfyui\models\Paraformer-Large\fsmn-vad
 F:\code\comfyui\models\SenseVoiceSmall\fsmn-vad
 ```
 
@@ -59,7 +51,7 @@ F:\code\comfyui\models\SenseVoiceSmall\ct-punc
 F:\code\comfyui\models\SenseVoiceSmall\cam++
 ```
 
-For offline deployment, pre-place the `Fun-ASR-Nano-2512` model folder and the `runtime` folder above.
+For offline deployment, pre-place the model folders above.
 
 ## Dependencies
 
@@ -73,7 +65,7 @@ The plugin skips FunASR's per-model `requirements.txt` auto-install step at runt
 
 ## Inputs
 
-- `model`: `Fun-ASR-Nano-2512` or `SenseVoiceSmall`
+- `model`: `Paraformer-Large` or `SenseVoiceSmall`
 - `language`: `auto`, `zh`, `en`, `yue`, `ja`, `ko`, `nospeech`
 - `device`: `auto`, `cuda:0`, `cpu`
 - `use_itn`: inverse text normalization
