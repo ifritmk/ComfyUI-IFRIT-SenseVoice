@@ -32,6 +32,14 @@ VAD_MODEL_IDS = {
     "hf": "funasr/fsmn-vad",
     "ms": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
 }
+PUNC_MODEL_IDS = {
+    "hf": "funasr/ct-punc",
+    "ms": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+}
+SPK_MODEL_IDS = {
+    "hf": "funasr/campplus",
+    "ms": "iic/speech_campplus_sv_zh-cn_16k-common",
+}
 NANO_RUNTIME_FILES = ("model.py", "ctc.py", "tools/utils.py")
 
 
@@ -142,7 +150,15 @@ def _ensure_nano_runtime(config, local_model):
     return model_code.replace("\\", "/")
 
 
-def _get_model(model_choice, vad_model, device):
+def _optional_pipeline_model(config, choice, local_dir_name, ids, label):
+    if not choice or choice == "none":
+        return None
+    model_id = ids[config["hub"]]
+    model_dir = os.path.join(config["dir"], local_dir_name)
+    return _ensure_model(model_id, model_dir, config["hub"], label)
+
+
+def _get_model(model_choice, vad_model, punc_model, spk_model, device):
     config = _model_config(model_choice)
     local_model = _resolve_local_model(model_choice)
     remote_code = None
@@ -150,6 +166,8 @@ def _get_model(model_choice, vad_model, device):
         remote_code = _ensure_nano_runtime(config, local_model)
 
     local_vad_model = None
+    local_punc_model = None
+    local_spk_model = None
     if vad_model and vad_model != "none":
         vad_model_id = VAD_MODEL_IDS[config["hub"]]
         vad_model_dir = os.path.join(config["dir"], "fsmn-vad")
@@ -159,8 +177,20 @@ def _get_model(model_choice, vad_model, device):
             print(f"[FunASR] Skip fsmn-vad for {model_choice}; local VAD model not found: {vad_model_dir}")
         else:
             local_vad_model = _ensure_model(vad_model_id, vad_model_dir, config["hub"], "fsmn-vad")
+    if model_choice == "SenseVoiceSmall":
+        local_punc_model = _optional_pipeline_model(config, punc_model, "ct-punc", PUNC_MODEL_IDS, "ct-punc")
+        local_spk_model = _optional_pipeline_model(config, spk_model, "cam++", SPK_MODEL_IDS, "cam++")
+        if local_spk_model and not local_punc_model:
+            raise RuntimeError("spk_model=cam++ requires punc_model=ct-punc.")
 
-    cache_key = (model_choice, local_model, local_vad_model or "none", device)
+    cache_key = (
+        model_choice,
+        local_model,
+        local_vad_model or "none",
+        local_punc_model or "none",
+        local_spk_model or "none",
+        device,
+    )
     if cache_key in MODEL_CACHE:
         return MODEL_CACHE[cache_key]
 
@@ -189,6 +219,11 @@ def _get_model(model_choice, vad_model, device):
     if local_vad_model:
         kwargs["vad_model"] = local_vad_model
         kwargs["vad_kwargs"] = {"max_single_segment_time": 30000}
+    if local_punc_model:
+        kwargs["punc_model"] = local_punc_model
+    if local_spk_model:
+        kwargs["spk_model"] = local_spk_model
+        kwargs["spk_mode"] = "punc_segment"
 
     model = AutoModel(**kwargs)
     MODEL_CACHE[cache_key] = model
@@ -257,10 +292,23 @@ def _srt_timestamp(seconds):
     return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
 
-def _append_srt_entry(entries, text, start, end):
+def _seconds_from_milliseconds(value):
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value) / 1000.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_srt_entry(entries, text, start, end, milliseconds=False):
     text = str(text or "").strip()
-    start = _seconds_from_any(start)
-    end = _seconds_from_any(end)
+    if milliseconds:
+        start = _seconds_from_milliseconds(start)
+        end = _seconds_from_milliseconds(end)
+    else:
+        start = _seconds_from_any(start)
+        end = _seconds_from_any(end)
     if not text or start is None or end is None:
         return
     if end <= start:
@@ -275,6 +323,10 @@ def _first_present(item, *keys):
     return None
 
 
+def _is_sentence_break(token):
+    return token in {".", "!", "?", "\u3002", "\uff01", "\uff1f"}
+
+
 def _collect_srt_entries_from_item(item, entries):
     if not isinstance(item, dict):
         return
@@ -284,11 +336,16 @@ def _collect_srt_entries_from_item(item, entries):
         for sentence in sentence_info:
             if not isinstance(sentence, dict):
                 continue
+            text = sentence.get("text", sentence.get("sentence", ""))
+            speaker = _first_present(sentence, "speaker", "spk", "spk_id")
+            if speaker is not None:
+                text = f"Speaker {speaker}: {text}"
             _append_srt_entry(
                 entries,
-                sentence.get("text", sentence.get("sentence", "")),
+                text,
                 _first_present(sentence, "start", "start_time"),
                 _first_present(sentence, "end", "end_time"),
+                milliseconds=True,
             )
 
     timestamps = item.get("timestamp")
@@ -303,7 +360,7 @@ def _collect_srt_entries_from_item(item, entries):
                 text = words[index]
             else:
                 text = item.get("text")
-            _append_srt_entry(entries, text, chunk[0], chunk[1])
+            _append_srt_entry(entries, text, chunk[0], chunk[1], milliseconds=True)
 
     for timestamp_key, text_key in (("timestamps", "text"), ("ctc_timestamps", "ctc_text")):
         token_timestamps = item.get(timestamp_key)
@@ -335,7 +392,7 @@ def _collect_srt_entries_from_item(item, entries):
             group_end = end
             group_tokens.append(token)
             text = "".join(group_tokens)
-            if token in "。！？!?." or (group_end - group_start) >= 6.0:
+            if _is_sentence_break(token) or (group_end - group_start) >= 6.0:
                 _append_srt_entry(entries, re.sub(r"\s+", " ", text).strip(), group_start, group_end)
                 group_start = None
                 group_end = None
@@ -413,6 +470,8 @@ class SenseVoiceTranscribeAudio:
             },
             "optional": {
                 "vad_model": (["none", "fsmn-vad"],),
+                "punc_model": (["none", "ct-punc"],),
+                "spk_model": (["none", "cam++"],),
             },
         }
 
@@ -421,7 +480,18 @@ class SenseVoiceTranscribeAudio:
     FUNCTION = "transcribe"
     CATEGORY = "FunASR"
 
-    def transcribe(self, audio, model, language, device, use_itn, batch_size_s, vad_model="none"):
+    def transcribe(
+        self,
+        audio,
+        model,
+        language,
+        device,
+        use_itn,
+        batch_size_s,
+        vad_model="none",
+        punc_model="none",
+        spk_model="none",
+    ):
         duration = _audio_duration(audio)
         audio_path = _save_audio_to_temp(audio)
         try:
@@ -433,6 +503,8 @@ class SenseVoiceTranscribeAudio:
                 use_itn,
                 batch_size_s,
                 vad_model,
+                punc_model,
+                spk_model,
                 duration,
             )
         finally:
@@ -456,6 +528,8 @@ class SenseVoiceTranscribeFile:
             },
             "optional": {
                 "vad_model": (["none", "fsmn-vad"],),
+                "punc_model": (["none", "ct-punc"],),
+                "spk_model": (["none", "cam++"],),
             },
         }
 
@@ -464,7 +538,19 @@ class SenseVoiceTranscribeFile:
     FUNCTION = "transcribe"
     CATEGORY = "FunASR"
 
-    def transcribe(self, audio_path, model, language, device, use_itn, batch_size_s, vad_model="none", audio_duration=None):
+    def transcribe(
+        self,
+        audio_path,
+        model,
+        language,
+        device,
+        use_itn,
+        batch_size_s,
+        vad_model="none",
+        punc_model="none",
+        spk_model="none",
+        audio_duration=None,
+    ):
         if not audio_path:
             raise RuntimeError("audio_path is empty.")
 
@@ -476,7 +562,7 @@ class SenseVoiceTranscribeFile:
 
         infer_device = _get_device(device)
         config = _model_config(model)
-        recognizer = _get_model(model, vad_model, infer_device)
+        recognizer = _get_model(model, vad_model, punc_model, spk_model, infer_device)
         language_arg = "auto" if language == "auto" else language
 
         generate_kwargs = {
