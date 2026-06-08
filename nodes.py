@@ -386,7 +386,7 @@ def _collect_srt_entries_from_item(item, entries):
             elif isinstance(words, list) and index < len(words):
                 text = words[index]
             else:
-                text = item.get("text")
+                continue
             _append_srt_entry(entries, text, chunk[0], chunk[1], milliseconds=True)
 
     for timestamp_key, text_key in (("timestamps", "text"), ("ctc_timestamps", "ctc_text")):
@@ -405,11 +405,6 @@ def _collect_srt_entries_from_item(item, entries):
         if not token_entries:
             continue
 
-        fallback_text = str(item.get(text_key, "")).strip()
-        if fallback_text:
-            _append_srt_entry(entries, fallback_text, token_entries[0][0], token_entries[-1][1])
-            return
-
         group_start = None
         group_end = None
         group_tokens = []
@@ -419,7 +414,7 @@ def _collect_srt_entries_from_item(item, entries):
             group_end = end
             group_tokens.append(token)
             text = "".join(group_tokens)
-            if _is_sentence_break(token) or (group_end - group_start) >= 6.0:
+            if _is_sentence_break(token) or (group_end - group_start) >= 6.0 or len(group_tokens) >= 24:
                 _append_srt_entry(entries, re.sub(r"\s+", " ", text).strip(), group_start, group_end)
                 group_start = None
                 group_end = None
